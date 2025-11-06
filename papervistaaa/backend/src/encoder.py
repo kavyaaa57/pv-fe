@@ -1,14 +1,11 @@
-# src/encoder.py
 from sentence_transformers import SentenceTransformer
 from src.config import SENTENCE_MODEL_NAME
 
 class TextEncoder:
-    """Manages the S-BERT model for generating semantic embeddings."""
     def __init__(self, model_name=SENTENCE_MODEL_NAME):
         self.model = self._load_model(model_name)
     
     def _load_model(self, model_name):
-        """Loads the Sentence Transformer model."""
         print(f"Loading S-BERT Model: {model_name}...")
         try:
             model = SentenceTransformer(model_name)
@@ -19,7 +16,6 @@ class TextEncoder:
             return None
 
     def get_embeddings(self, texts):
-        """Converts a list of text chunks into numerical embeddings."""
         if not self.model or not texts:
             return None
         print(f"Encoding {len(texts)} chunks...")
