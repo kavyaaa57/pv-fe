@@ -1,0 +1,354 @@
+# main_app.py
+
+import questionary
+import sys
+import os
+import torch
+import numpy as np
+from PIL import Image 
+
+# --- Import Core Plagiarism Modules from src/ ---
+from src.data_processor import process_file_to_chunks
+from src.encoder import TextEncoder
+from src.lexical_checker import perform_lexical_check, find_lexical_matches
+from src.similarity_checker import compare_semantic_embeddings, find_semantic_matches, generate_full_report
+from src.web_scraper import fetch_and_process_web_references
+from src.image_detector import check_image_plagiarism
+from src.config import SEMANTIC_THRESHOLD, LEXICAL_THRESHOLD, CHUNK_SIZE_SENTENCES
+
+# --- Import Automated Web Search Module (Optional/External) ---
+auto_search_enabled = False
+try:
+    from src.auto_searcher import fetch_web_results as actual_fetch_web_results
+    fetch_web_results = actual_fetch_web_results
+    auto_search_enabled = True
+except ImportError as e:
+    def fetch_web_results(chunks): return []
+
+# --- Import Spelling and Grammar Module (Final Structure) ---
+try:
+    from spelling_grammar import check_spelling_and_grammar
+except ImportError as e:
+    print(f"Warning: Could not import spelling_grammar package. Error: {e}")
+    def check_spelling_and_grammar(text): return {"status": "SKIPPED", "message": "Module failed to load.", "total_errors": 0}
+
+
+# --- Utility to list files in the current directory (Pure CLI File Picker) ---
+
+def list_files_in_current_dir(file_type_hint=""):
+    """Lists files in the current directory for selection."""
+    files = [f for f in os.listdir('.') if os.path.isfile(f)]
+    if not files:
+        return [f"No files found in {os.getcwd()}"]
+    
+    if file_type_hint:
+         files = [f for f in files if f.lower().endswith(tuple(file_type_hint.split()))]
+    
+    files.insert(0, "Manually Enter Path...")
+    files.insert(0, "Refresh List")
+    return files
+
+def get_file_path_cli(prompt, file_type_hint=""):
+    """Interactive CLI method to select or input a file path."""
+    while True:
+        options = list_files_in_current_dir(file_type_hint)
+        choice = questionary.select(prompt, choices=options).ask()
+        
+        if choice is None:
+            return None 
+
+        if choice == "Refresh List":
+            continue
+        elif choice == "Manually Enter Path...":
+            selected_file = questionary.text("Enter full path:").ask()
+            if selected_file and os.path.exists(selected_file):
+                return selected_file
+            print("Invalid path or file not found.")
+        elif choice and os.path.exists(choice):
+            return choice
+        
+        else:
+            print("Invalid selection or file not found.")
+            return None
+
+# --- NEW: Function to Gather Suspect Input (Text or File) ---
+
+def gather_suspect_input():
+    """Handles the user's choice of suspect input source (Text or File)."""
+    
+    mode_choice = questionary.select(
+        "Choose the SUSPECT content source:",
+        choices=['1. Type Text Directly', '2. Select File (TXT/PDF/DOCX)', '3. Select Image File'],
+    ).ask()
+
+    suspect_content = None
+    suspect_file_path = None
+    
+    if mode_choice is None: 
+        return None, None
+
+    if mode_choice == '1. Type Text Directly':
+        suspect_content = questionary.text("Paste/Type Suspect Text:").ask()
+    
+    elif mode_choice == '2. Select File (TXT/PDF/DOCX)':
+        suspect_file_path = get_file_path_cli("Select Suspect Document", file_type_hint=".txt .pdf .docx")
+    
+    elif mode_choice == '3. Select Image File':
+        suspect_file_path = get_file_path_cli("Select Suspect Image", file_type_hint=".png .jpg .jpeg")
+
+    # Handle direct text input by writing to a temporary file
+    if suspect_content:
+        temp_dir = 'temp_cli_files'
+        os.makedirs(temp_dir, exist_ok=True)
+        suspect_file_path = os.path.join(temp_dir, f"suspect_{os.urandom(8).hex()}.txt")
+        with open(suspect_file_path, 'w', encoding='utf-8') as f:
+            f.write(suspect_content)
+            
+    return suspect_file_path, suspect_content
+
+
+# --- NEW: Interactive Grammar Correction Logic ---
+
+def run_interactive_correction(suspect_full_text, grammar_results):
+    """Allows user to accept or reject grammar suggestions."""
+    
+    if grammar_results['total_errors'] == 0:
+        print("\n✅ Text is grammatically sound. No corrections needed.")
+        return suspect_full_text
+
+    print(f"\n--- INTERACTIVE CORRECTION ({grammar_results['total_errors']} Issues) ---")
+    
+    corrected_text = suspect_full_text
+    
+    # Process errors in reverse order to ensure offsets remain valid
+    for error in reversed(grammar_results['errors']):
+        suggestions = error['suggestions']
+        
+        if not suggestions:
+            continue
+            
+        print(f"\nRule: {error['context_message']} (Category: {error['category']})")
+        print(f"Error: '{error['error_text']}'")
+        
+        choices = [s for s in suggestions]
+        choices.append("Skip (No change)")
+        
+        # Determine the position of the error (Requires reading the original file content)
+        try:
+             start_index = corrected_text.rindex(error['error_text'], 0, error['offset'] + len(error['error_text']))
+        except ValueError:
+             # Fallback if text has been modified previously or rindex fails
+             start_index = corrected_text.find(error['error_text'])
+        
+        if start_index == -1: continue # Skip if error text not found
+
+        # Display context (20 chars before/after)
+        context_start = max(0, start_index - 20)
+        context_end = min(len(corrected_text), start_index + len(error['error_text']) + 20)
+        
+        context = corrected_text[context_start:context_end]
+        
+        # Highlight the error segment
+        highlighted_context = context.replace(error['error_text'], f"[ERROR: {error['error_text']}]", 1)
+        print(f"Context: ...{highlighted_context}...")
+
+        user_choice = questionary.select("Select Correction:", choices=choices).ask()
+        
+        if user_choice not in ["Skip (No change)", None]:
+            # Apply the correction to the text
+            end_index = start_index + len(error['error_text'])
+            corrected_text = corrected_text[:start_index] + user_choice + corrected_text[end_index:]
+            
+    return corrected_text
+
+
+# --- Core Plagiarism Check Function ---
+
+def run_plagiarism_check(suspect_file_path, local_reference_paths, manual_web_urls):
+    """
+    Orchestrates the entire detection pipeline. (Previous Functionality)
+    """
+    # ... (Code structure is the same as the previous run_plagiarism_check) ...
+
+    print("\n--- Starting Hybrid Plagiarism Detection System ---")
+    
+    encoder = TextEncoder()
+    if not encoder.model:
+        return "System failed to load the core model."
+
+    # Process Suspect Document
+    suspect_chunks = process_file_to_chunks(suspect_file_path, CHUNK_SIZE_SENTENCES)
+    
+    # --- AUTOMATIC WEB SEARCH AND CONSOLIDATION ---
+    
+    auto_web_urls = []
+    if auto_search_enabled and suspect_chunks:
+        print("\n[STEP 2a] Running Automated Web Search (via Google API)...")
+        auto_web_urls = fetch_web_results(suspect_chunks)
+    
+    all_web_urls = list(set(auto_web_urls + manual_web_urls))
+    
+    # Process Reference Corpus
+    all_reference_chunks = []
+    
+    # A. Local Files
+    print("\n[STEP 1] Processing Local Reference Files...")
+    for ref_path in local_reference_paths:
+        ref_chunks = process_file_to_chunks(ref_path, CHUNK_SIZE_SENTENCES)
+        all_reference_chunks.extend(ref_chunks)
+        
+    # B. Web Sources
+    print(f"[STEP 2b] Scraping {len(all_web_urls)} External Sources...")
+    web_chunks = fetch_and_process_web_references(all_web_urls, CHUNK_SIZE_SENTENCES)
+    all_reference_chunks.extend(web_chunks)
+
+    # --- 3. Plagiarism Checks ---
+    
+    if not suspect_chunks or not all_reference_chunks:
+        print("\n--- Text checks skipped: Not enough comparable content. ---")
+    else:
+        # Lexical Check
+        lexical_matrix = perform_lexical_check(suspect_chunks, all_reference_chunks)
+        lexical_matches = find_lexical_matches(suspect_chunks, all_reference_chunks, lexical_matrix, LEXICAL_THRESHOLD)
+        
+        # Semantic Check
+        suspect_embeddings = encoder.get_embeddings(suspect_chunks)
+        reference_embeddings = encoder.get_embeddings(all_reference_chunks)
+        semantic_matrix = compare_semantic_embeddings(suspect_embeddings, reference_embeddings) 
+        semantic_matches = find_semantic_matches(suspect_chunks, all_reference_chunks, semantic_matrix, SEMANTIC_THRESHOLD)
+
+        print(f"\n--- Final Text Report (Hybrid Check) ---")
+        generate_full_report(semantic_matches, lexical_matches, len(suspect_chunks))
+        
+    # --- 4. Image/Visual Check ---
+    print("\n[STEP 4] Performing Image Plagiarism Check...")
+    image_check_result = check_image_plagiarism(suspect_file_path, local_reference_paths)
+
+    # --- 5. Final Report Summary ---
+    
+    print("\n--- Visual Plagiarism Check ---")
+    if isinstance(image_check_result, list):
+        for res in image_check_result:
+            print(f"- {res['status']} against {res['reference_file']}. Distance: {res['distance']} (Similarity: {res['similarity']*100:.2f}%)")
+    else:
+        print(image_check_result)
+    
+    print("\n--- System Check Complete ---")
+
+
+# --- Main Application Loop (The Two-Level Menu) ---
+
+def main():
+    
+    TEST_DIR = "."
+    
+    # --- Initial Setup ---
+    temp_files_to_cleanup = []
+    
+    # Create temp directory
+    temp_dir = 'temp_cli_files'
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Create dummy files for reference check 
+    with open(os.path.join(TEST_DIR, "ref_source_1.txt"), "w") as f:
+        f.write("Python is a popular, high-level, general-purpose programming language known for its readability and beginner-friendliness.")
+    try:
+        Image.new('RGB', (100, 100), color = '#FD0000').save(os.path.join(TEST_DIR, "ref_image_2.png"))
+    except ImportError:
+        pass 
+
+    while True:
+        print("\n==============================================================")
+        main_choice = questionary.select(
+            "MAIN MENU: Choose Service",
+            choices=['1. Spelling & Grammar Check', '2. Plagiarism Check', '3. Exit'],
+        ).ask()
+        
+        if main_choice is None or main_choice == '3. Exit':
+            break
+
+        # --- Gather Suspect Input (Text or File) ---
+        suspect_file_path, suspect_content = gather_suspect_input()
+        
+        if suspect_file_path is None:
+            continue
+        
+        # --- Gather References (Needed only for Plagiarism Check) ---
+        local_references = []
+        web_references = []
+        
+        if main_choice == '2. Plagiarism Check':
+            print("\n--- Gathering References for Plagiarism Check ---")
+            
+            # Add dummy references automatically 
+            local_references.append(os.path.join(TEST_DIR, "ref_source_1.txt"))
+            local_references.append(os.path.join(TEST_DIR, "ref_image_2.png"))
+
+            while True:
+                ref_choice = questionary.select(
+                    "Add Reference:",
+                    choices=['Local File/Image', 'Web URL (Auto-Search/Manual)', 'DONE - Start Check'],
+                ).ask()
+                
+                if ref_choice is None or ref_choice == 'DONE - Start Check':
+                    break
+                
+                elif ref_choice == 'Local File/Image':
+                    ref_path = get_file_path_cli("Select Reference File/Image")
+                    if ref_path and os.path.exists(ref_path):
+                        local_references.append(ref_path)
+                        print(f"Added local reference: {os.path.basename(ref_path)}")
+                
+                elif ref_choice == 'Web URL (Auto-Search/Manual)':
+                    # Note: Automatic search is run inside run_plagiarism_check
+                    url = questionary.text("Enter specific URL to scrape (Optional):").ask()
+                    if url:
+                        web_references.append(url)
+                        print(f"Added manual web reference: {url}")
+
+        # --- EXECUTE SERVICE ---
+        try:
+            if main_choice == '1. Spelling & Grammar Check':
+                # Load content from the temp file written by gather_suspect_input()
+                with open(suspect_file_path, 'r', encoding='utf-8') as f:
+                    suspect_full_text = f.read()
+                
+                grammar_results = check_spelling_and_grammar(suspect_full_text)
+                
+                # Run Interactive Correction
+                if grammar_results['total_errors'] > 0:
+                    print(f"\n--- Grammar Check Found {grammar_results['total_errors']} Issues ---")
+                    corrected_text = run_interactive_correction(suspect_full_text, grammar_results)
+                    print("\n--- FINAL CORRECTED TEXT ---")
+                    print(corrected_text)
+                    print("----------------------------")
+                else:
+                    print("\n✅ Text is grammatically sound. No errors found.")
+                    
+            
+            elif main_choice == '2. Plagiarism Check':
+                run_plagiarism_check(suspect_file_path, local_references, web_references)
+
+        except Exception as e:
+            print(f"\n!!! FATAL EXECUTION ERROR: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # --- Cleanup after each full service run ---
+        finally:
+            for fpath in temp_files_to_cleanup:
+                if os.path.exists(fpath):
+                    os.remove(fpath)
+            temp_files_to_cleanup = [] # Reset cleanup list
+            if os.path.exists('temp_cli_files') and not os.listdir('temp_cli_files'):
+                 os.rmdir('temp_cli_files')
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        # Final cleanup for dummy files on exit
+        for f in ["ref_source_1.txt", "ref_image_2.png"]:
+            if os.path.exists(os.path.join(".", f)):
+                os.remove(os.path.join(".", f))

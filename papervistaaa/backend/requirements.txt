@@ -1,0 +1,11 @@
+sentence-transformers
+numpy
+PyPDF2
+Pillow
+imagehash
+requests
+beautifulsoup4
+nltk
+questionary
+google-api-python-client
+language-tool-python
